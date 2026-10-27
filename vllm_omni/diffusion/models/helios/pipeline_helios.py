@@ -27,6 +27,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.helios.conditioning_cache import (
+    HeliosConditioningCache,
+    request_conditioning_cache,
+)
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -562,19 +566,23 @@ class HeliosPipeline(
                 "zero_steps": int(extra.get("zero_steps", 1)),
             }
         )
-        self.prepare_next_chunk(state)
         return state
 
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
         """Expose this chunk's decoded media extent for interaction timelines."""
-        num_frames = int(state.extra["window_num_frames"])
+        num_media_frames = int(state.extra["window_num_frames"])
+        num_latent_frames = int(state.extra["num_latent_frames_per_chunk"])
         fps = state.sampling.fps
         if fps is None or float(fps) <= 0:
             raise ValueError(
                 "sampling.fps is required and must be > 0 for interaction modalities that use the "
                 f"chunk media timeline, got {fps!r} (request_id={state.request_id!r})"
             )
-        return ChunkMediaSpec(num_frames=num_frames, fps=float(fps))
+        return ChunkMediaSpec(
+            num_media_frames=num_media_frames,
+            fps=float(fps),
+            num_latent_frames=num_latent_frames,
+        )
 
     @override
     def prepare_next_chunk(self, state: StepRequestState) -> None:
@@ -709,9 +717,23 @@ class HeliosPipeline(
         if len(states) != 1:
             raise ValueError("Helios step execution supports a single request, not a batched request.")
         state = states[0]
-        if state.extra["is_enable_stage2"]:
-            return self._denoise_stage2_step(state)
-        return self._denoise_stage1_step(state, input_batch.latents, input_batch.timesteps)
+        cache = state.extra.get("helios_conditioning_cache")
+        if cache is None:
+            cache = HeliosConditioningCache(state.request_id)
+            state.extra["helios_conditioning_cache"] = cache
+        try:
+            with cache.activate():
+                if state.extra["is_enable_stage2"]:
+                    return self._denoise_stage2_step(state)
+                return self._denoise_stage1_step(state, input_batch.latents, input_batch.timesteps)
+        except BaseException:
+            self.release_step_request(state)
+            raise
+
+    def release_step_request(self, state: StepRequestState) -> None:
+        cache = state.extra.pop("helios_conditioning_cache", None)
+        if cache is not None:
+            cache.close()
 
     def _denoise_stage1_step(
         self,
@@ -744,6 +766,7 @@ class HeliosPipeline(
             )[0]
             noise_uncond = self.transformer(
                 encoder_hidden_states=state.negative_prompt_embeds,
+                conditioning_branch="negative",
                 **transformer_kwargs,
             )[0]
             positive_flat = noise_pred.view(batch_size, -1)
@@ -761,6 +784,7 @@ class HeliosPipeline(
         negative_kwargs = (
             {
                 "encoder_hidden_states": state.negative_prompt_embeds,
+                "conditioning_branch": "negative",
                 **transformer_kwargs,
             }
             if state.do_true_cfg
@@ -798,7 +822,9 @@ class HeliosPipeline(
         }
         noise_pred = self.transformer(encoder_hidden_states=state.prompt_embeds, **transformer_kwargs)[0]
         if state.do_true_cfg:
-            noise_uncond = self.transformer(encoder_hidden_states=state.negative_prompt_embeds, **transformer_kwargs)[0]
+            noise_uncond = self.transformer(
+                encoder_hidden_states=state.negative_prompt_embeds, conditioning_branch="negative", **transformer_kwargs
+            )[0]
             if extra["use_cfg_zero_star"]:
                 positive_flat = noise_pred.view(batch_size, -1)
                 negative_flat = noise_uncond.view(batch_size, -1)
@@ -944,6 +970,7 @@ class HeliosPipeline(
         state.chunk_index += 1
         finished = state.request_denoise_completed
         if finished:
+            self.release_step_request(state)
             self._current_timestep = None
             if current_omni_platform.is_available():
                 current_omni_platform.empty_cache()
@@ -956,6 +983,7 @@ class HeliosPipeline(
             finished=finished,
         )
 
+    @request_conditioning_cache
     def forward(
         self,
         req: DiffusionRequestBatch,
@@ -1415,6 +1443,7 @@ class HeliosPipeline(
 
                     noise_uncond = self.transformer(
                         encoder_hidden_states=negative_prompt_embeds,
+                        conditioning_branch="negative",
                         **transformer_kwargs,
                     )[0]
 
@@ -1436,6 +1465,7 @@ class HeliosPipeline(
                     if do_true_cfg:
                         negative_kwargs = {
                             "encoder_hidden_states": negative_prompt_embeds,
+                            "conditioning_branch": "negative",
                             **transformer_kwargs,
                         }
                     else:
@@ -1579,6 +1609,7 @@ class HeliosPipeline(
                     if do_true_cfg:
                         noise_uncond = self.transformer(
                             encoder_hidden_states=negative_prompt_embeds,
+                            conditioning_branch="negative",
                             **transformer_kwargs,
                         )[0]
 
@@ -1812,5 +1843,6 @@ class HeliosPipeline(
         return first_frame_latent.to(device=device, dtype=dtype), video_latents.to(device=device, dtype=dtype)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        self.transformer.clear_cross_attention_cache()
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
